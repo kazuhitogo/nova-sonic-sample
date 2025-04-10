@@ -4,7 +4,8 @@ import asyncio
 import base64
 import json
 import uuid
-import pyaudio
+import sounddevice as sd
+import numpy as np
 
 from aws_sdk_bedrock_runtime.client import (
     BedrockRuntimeClient,
@@ -27,13 +28,13 @@ from smithy_aws_core.credentials_resolvers.environment import (
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
 CHANNELS = 1
-FORMAT = pyaudio.paInt16
 CHUNK_SIZE = 1024
+DTYPE = np.int16
 
 
 class NovaVoiceChat:
     def __init__(
-        self, model_id='amazon.nova-sonic-v1:0', region='us-east-1', voice_id='matthew'
+        self, model_id="amazon.nova-sonic-v1:0", region="us-east-1", voice_id="tiffany"
     ):
         self.model_id = model_id
         self.region = region
@@ -48,6 +49,8 @@ class NovaVoiceChat:
         self.audio_queue = asyncio.Queue()
         self.display_assistant_text = False
         self.role = None
+        self.audio_output_stream = None
+        self.audio_buffer = np.array([], dtype=DTYPE)
 
     def _initialize_client(self):
         """Bedrockクライアントを初期化"""
@@ -63,7 +66,7 @@ class NovaVoiceChat:
     async def send_event(self, event_json):
         """イベントをストリームに送信"""
         event = InvokeModelWithBidirectionalStreamInputChunk(
-            value=BidirectionalInputPayloadPart(bytes_=event_json.encode('utf-8'))
+            value=BidirectionalInputPayloadPart(bytes_=event_json.encode("utf-8"))
         )
         await self.stream.input_stream.send(event)
 
@@ -79,31 +82,28 @@ class NovaVoiceChat:
         self.is_active = True
 
         # セッション開始イベントを送信
-        session_start = '''
-        {
-          "event": {
-            "sessionStart": {
-              "inferenceConfiguration": {
+        session_start = """{
+    "event": {
+        "sessionStart": {
+            "inferenceConfiguration": {
                 "maxTokens": 1024,
                 "topP": 0.9,
                 "temperature": 0.7
-              }
             }
-          }
         }
-        '''
+    }
+}"""
         await self.send_event(session_start)
 
         # プロンプト開始イベントを送信
-        prompt_start = f'''
-        {{
-          "event": {{
-            "promptStart": {{
-              "promptName": "{self.prompt_name}",
-              "textOutputConfiguration": {{
+        prompt_start = f"""{{
+    "event": {{
+        "promptStart": {{
+            "promptName": "{self.prompt_name}",
+            "textOutputConfiguration": {{
                 "mediaType": "text/plain"
-              }},
-              "audioOutputConfiguration": {{
+            }},
+            "audioOutputConfiguration": {{
                 "mediaType": "audio/lpcm",
                 "sampleRateHertz": 24000,
                 "sampleSizeBits": 16,
@@ -111,15 +111,14 @@ class NovaVoiceChat:
                 "voiceId": "{self.voice_id}",
                 "encoding": "base64",
                 "audioType": "SPEECH"
-              }}
             }}
-          }}
         }}
-        '''
+    }}
+}}"""
         await self.send_event(prompt_start)
 
         # システムプロンプトを送信
-        text_content_start = f'''
+        text_content_start = f"""
         {{
             "event": {{
                 "contentStart": {{
@@ -134,7 +133,7 @@ class NovaVoiceChat:
                 }}
             }}
         }}
-        '''
+        """
         await self.send_event(text_content_start)
 
         system_prompt = (
@@ -143,7 +142,7 @@ class NovaVoiceChat:
             "generally two or three sentences for chatty scenarios."
         )
 
-        text_input = f'''
+        text_input = f"""
         {{
             "event": {{
                 "textInput": {{
@@ -153,10 +152,10 @@ class NovaVoiceChat:
                 }}
             }}
         }}
-        '''
+        """
         await self.send_event(text_input)
 
-        text_content_end = f'''
+        text_content_end = f"""
         {{
             "event": {{
                 "contentEnd": {{
@@ -165,7 +164,7 @@ class NovaVoiceChat:
                 }}
             }}
         }}
-        '''
+        """
         await self.send_event(text_content_end)
 
         # レスポンス処理を開始
@@ -173,7 +172,7 @@ class NovaVoiceChat:
 
     async def start_audio_input(self):
         """音声入力ストリームを開始"""
-        audio_content_start = f'''
+        audio_content_start = f"""
         {{
             "event": {{
                 "contentStart": {{
@@ -193,7 +192,7 @@ class NovaVoiceChat:
                 }}
             }}
         }}
-        '''
+        """
         await self.send_event(audio_content_start)
 
     async def send_audio_chunk(self, audio_bytes):
@@ -202,7 +201,7 @@ class NovaVoiceChat:
             return
 
         blob = base64.b64encode(audio_bytes)
-        audio_event = f'''
+        audio_event = f"""
         {{
             "event": {{
                 "audioInput": {{
@@ -212,12 +211,12 @@ class NovaVoiceChat:
                 }}
             }}
         }}
-        '''
+        """
         await self.send_event(audio_event)
 
     async def end_audio_input(self):
         """音声入力ストリームを終了"""
-        audio_content_end = f'''
+        audio_content_end = f"""
         {{
             "event": {{
                 "contentEnd": {{
@@ -226,7 +225,7 @@ class NovaVoiceChat:
                 }}
             }}
         }}
-        '''
+        """
         await self.send_event(audio_content_end)
 
     async def end_session(self):
@@ -234,7 +233,7 @@ class NovaVoiceChat:
         if not self.is_active:
             return
 
-        prompt_end = f'''
+        prompt_end = f"""
         {{
             "event": {{
                 "promptEnd": {{
@@ -242,16 +241,16 @@ class NovaVoiceChat:
                 }}
             }}
         }}
-        '''
+        """
         await self.send_event(prompt_end)
 
-        session_end = '''
+        session_end = """
         {
             "event": {
                 "sessionEnd": {}
             }
         }
-        '''
+        """
         await self.send_event(session_end)
         # ストリームを閉じる
         await self.stream.input_stream.close()
@@ -265,31 +264,31 @@ class NovaVoiceChat:
                 result = await output[1].receive()
 
                 if result.value and result.value.bytes_:
-                    response_data = result.value.bytes_.decode('utf-8')
+                    response_data = result.value.bytes_.decode("utf-8")
                     json_data = json.loads(response_data)
 
-                    if 'event' in json_data:
+                    if "event" in json_data:
                         # コンテンツ開始イベントを処理
-                        if 'contentStart' in json_data['event']:
-                            content_start = json_data['event']['contentStart']
+                        if "contentStart" in json_data["event"]:
+                            content_start = json_data["event"]["contentStart"]
                             # ロールを設定
-                            self.role = content_start['role']
+                            self.role = content_start["role"]
                             # 推測内容を確認
-                            if 'additionalModelFields' in content_start:
+                            if "additionalModelFields" in content_start:
                                 additional_fields = json.loads(
-                                    content_start['additionalModelFields']
+                                    content_start["additionalModelFields"]
                                 )
                                 if (
-                                    additional_fields.get('generationStage')
-                                    == 'SPECULATIVE'
+                                    additional_fields.get("generationStage")
+                                    == "SPECULATIVE"
                                 ):
                                     self.display_assistant_text = True
                                 else:
                                     self.display_assistant_text = False
 
                         # テキスト出力イベントを処理
-                        elif 'textOutput' in json_data['event']:
-                            text = json_data['event']['textOutput']['content']
+                        elif "textOutput" in json_data["event"]:
+                            text = json_data["event"]["textOutput"]["content"]
 
                             if self.role == "ASSISTANT" and self.display_assistant_text:
                                 print(f"アシスタント: {text}")
@@ -297,8 +296,8 @@ class NovaVoiceChat:
                                 print(f"ユーザー: {text}")
 
                         # 音声出力を処理
-                        elif 'audioOutput' in json_data['event']:
-                            audio_content = json_data['event']['audioOutput']['content']
+                        elif "audioOutput" in json_data["event"]:
+                            audio_content = json_data["event"]["audioOutput"]["content"]
                             audio_bytes = base64.b64decode(audio_content)
                             await self.audio_queue.put(audio_bytes)
         except asyncio.CancelledError:
@@ -306,61 +305,95 @@ class NovaVoiceChat:
         except Exception as e:
             print(f"レスポンス処理エラー: {e}")
 
+    def audio_callback(self, outdata, frames, time, status):
+        """sounddeviceのコールバック関数"""
+        if status:
+            print(f"音声出力ステータス: {status}")
+
+        if len(self.audio_buffer) >= frames:
+            # 正しい形状に変換して出力
+            outdata[:] = self.audio_buffer[:frames].reshape(-1, CHANNELS)
+            self.audio_buffer = self.audio_buffer[frames:]
+        else:
+            if len(self.audio_buffer) > 0:
+                # 利用可能なデータを出力
+                outdata[: len(self.audio_buffer)] = self.audio_buffer.reshape(
+                    -1, CHANNELS
+                )
+                outdata[len(self.audio_buffer) :] = 0
+            else:
+                # データがない場合は無音を出力
+                outdata.fill(0)
+            self.audio_buffer = np.array([], dtype=DTYPE)
+
     async def play_audio(self):
         """音声レスポンスを再生"""
-        p = pyaudio.PyAudio()
-        stream = p.open(
-            format=FORMAT, channels=CHANNELS, rate=OUTPUT_SAMPLE_RATE, output=True
-        )
-
         try:
-            while self.is_active:
-                try:
-                    audio_data = await asyncio.wait_for(
-                        self.audio_queue.get(), timeout=0.5
-                    )
-                    stream.write(audio_data)
-                except asyncio.TimeoutError:
-                    # 音声データがない場合は続行
-                    continue
+            # 出力ストリームを開始
+            with sd.OutputStream(
+                samplerate=OUTPUT_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=DTYPE,
+                callback=self.audio_callback,
+                blocksize=CHUNK_SIZE,
+            ):
+                while self.is_active:
+                    try:
+                        audio_data = await asyncio.wait_for(
+                            self.audio_queue.get(), timeout=0.5
+                        )
+                        # バイトデータをnumpy配列に変換
+                        audio_array = np.frombuffer(audio_data, dtype=DTYPE)
+                        # バッファに追加
+                        self.audio_buffer = np.append(self.audio_buffer, audio_array)
+                    except asyncio.TimeoutError:
+                        # 音声データがない場合は続行
+                        continue
         except asyncio.CancelledError:
             print("音声再生がキャンセルされました")
         except Exception as e:
             print(f"音声再生エラー: {e}")
-        finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
+
+    def input_callback(self, indata, frames, time, status):
+        """マイク入力のコールバック関数"""
+        if status:
+            print(f"音声入力ステータス: {status}")
+
+        # 音声データをキューに入れる
+        if self.is_active:
+            # 適切な形状に変換してバイト列に変換
+            audio_bytes = indata.copy().tobytes()
+            asyncio.run_coroutine_threadsafe(
+                self.send_audio_chunk(audio_bytes), self.loop
+            )
 
     async def capture_audio(self):
         """マイクから音声をキャプチャしてNova Sonicに送信"""
-        p = pyaudio.PyAudio()
-        stream = p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=INPUT_SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE,
-        )
-
         print("マイクに向かって話してください...")
         print("終了するにはEnterキーを押してください...")
 
         await self.start_audio_input()
 
+        # 現在のイベントループを保存
+        self.loop = asyncio.get_running_loop()
+
         try:
-            while self.is_active:
-                audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                await self.send_audio_chunk(audio_data)
-                await asyncio.sleep(0.01)
+            # 入力ストリームを開始
+            with sd.InputStream(
+                samplerate=INPUT_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=DTYPE,
+                callback=self.input_callback,
+                blocksize=CHUNK_SIZE,
+            ):
+                # ユーザーがEnterを押すまで待機
+                while self.is_active:
+                    await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             print("音声キャプチャがキャンセルされました")
         except Exception as e:
             print(f"音声キャプチャエラー: {e}")
         finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
             print("音声キャプチャを停止しました")
             await self.end_audio_input()
 
@@ -428,9 +461,9 @@ async def main():
 if __name__ == "__main__":
     session = boto3.Session()
     credentials = session.get_credentials()
-    os.environ['AWS_ACCESS_KEY_ID'] = credentials.access_key
-    os.environ['AWS_SECRET_ACCESS_KEY'] = credentials.secret_key
-    os.environ['AWS_DEFAULT_REGION'] = "us-east-1"
+    os.environ["AWS_ACCESS_KEY_ID"] = credentials.access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = credentials.secret_key
+    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
 
     try:
         asyncio.run(main())
